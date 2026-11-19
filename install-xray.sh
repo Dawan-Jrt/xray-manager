@@ -54,7 +54,10 @@ echo "[4/6] Menyiapkan folder dan nginx..."
 mkdir -p /etc/xray-manager /var/log/xray
 echo "$DOMAIN" > /etc/xray-manager/domain
 touch /etc/xray-manager/accounts.db
-chown -R nobody:nogroup /var/log/xray
+# Xray versi baru jalan sebagai user "xray", versi lama sebagai "nobody": ikuti unit systemd
+XUSER=$(systemctl show -p User --value xray 2>/dev/null); XUSER=${XUSER:-nobody}
+XGROUP=$(systemctl show -p Group --value xray 2>/dev/null); XGROUP=${XGROUP:-$(id -gn "$XUSER")}
+chown -R "$XUSER:$XGROUP" /var/log/xray
 
 cat > /etc/nginx/conf.d/xray-manager.conf <<'NGINX'
 server {
@@ -122,11 +125,14 @@ CFG=/usr/local/etc/xray/config.json
 DOMAIN=$(cat /etc/xray-manager/domain 2>/dev/null)
 XRAY=/usr/local/bin/xray
 touch "$DB" "$LOCK"
+XGROUP=$(systemctl show -p Group --value xray 2>/dev/null)
+[ -n "$XGROUP" ] || XGROUP=$(id -gn "$(systemctl show -p User --value xray 2>/dev/null)" 2>/dev/null)
+[ -n "$XGROUP" ] || XGROUP=nogroup
 
 # Bangun ulang config Xray dari daftar akun (sumber kebenaran = accounts.db)
 rebuild() {
-  local tmp
-  tmp=$(mktemp)
+  local tmp out
+  tmp=$(mktemp --suffix=.json)
   jq -n --rawfile db "$DB" --rawfile lk "$LOCK" '
     def ok($L): (.n | IN($L[]) | not);
     ($db | split("\n") | map(select(length > 0) | split("|") | {p: .[0], n: .[1], s: .[2]})) as $a
@@ -153,12 +159,13 @@ rebuild() {
            ip: ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]}
         ]}
       }' > "$tmp" || { echo "Gagal membuat config."; rm -f "$tmp"; return 1; }
-  if ! "$XRAY" run -test -config "$tmp" >/dev/null 2>&1; then
+  if ! out=$("$XRAY" run -test -config "$tmp" 2>&1); then
     echo "Config tidak valid, perubahan dibatalkan."
+    echo "$out" | tail -n 5
     rm -f "$tmp"
     return 1
   fi
-  install -m 640 -o root -g nogroup "$tmp" "$CFG"
+  install -m 640 -o root -g "$XGROUP" "$tmp" "$CFG"
   rm -f "$tmp"
   systemctl restart xray || { echo "Xray gagal start. Cek: journalctl -u xray -n 20 --no-pager"; return 1; }
 }
