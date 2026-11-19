@@ -184,8 +184,16 @@ make_link() { # proto nama rahasia
   esac
 }
 
+# Teks bebas (1-30 karakter) -> UUIDv5 dengan namespace nol, sama dengan: xray uuid -i teks
+custom_uuid() {
+  local h n v
+  h=$({ head -c16 /dev/zero; printf '%s' "$1"; } | sha1sum | cut -c1-32)
+  n=$((16#${h:16:1})); v=$(printf '%x' $(( (n & 3) | 8 )))
+  echo "${h:0:8}-${h:8:4}-5${h:13:3}-${v}${h:17:3}-${h:20:12}"
+}
+
 add_account() {
-  local proto=$1 name days id exp lim
+  local proto=$1 name days id exp lim alias=""
   read -rp "Nama akun (huruf/angka/_/-, 3-20 karakter): " name
   [[ "$name" =~ ^[A-Za-z0-9_-]{3,20}$ ]] || { echo "Nama tidak valid."; return; }
   grep -q "^[^|]*|$name|" "$DB" && { echo "Nama sudah dipakai."; return; }
@@ -200,13 +208,17 @@ add_account() {
       echo "Password tidak valid."; return
     fi
   else
-    read -rp "UUID custom (kosong = acak): " id
+    read -rp "UUID custom (UUID penuh atau teks bebas 1-30 karakter, kosong = acak): " id
     if [ -z "$id" ]; then
       id=$(cat /proc/sys/kernel/random/uuid)
-    elif ! [[ "$id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-      echo "Format UUID tidak valid. Contoh: 123e4567-e89b-12d3-a456-426614174000"; return
+    elif [[ "$id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      id=${id,,}
+    elif [[ "$id" =~ ^[A-Za-z0-9_-]{1,30}$ ]]; then
+      alias=$id
+      id=$(custom_uuid "$alias")
+    else
+      echo "ID tidak valid. Pakai UUID penuh, atau teks 1-30 karakter (huruf/angka/_/-)."; return
     fi
-    id=${id,,}
   fi
   if cut -d'|' -f3 "$DB" | grep -qxF "$id"; then
     echo "UUID/password itu sudah dipakai akun lain."; return
@@ -223,6 +235,7 @@ add_account() {
     echo
     echo "Akun dibuat. Protokol: $proto | Berlaku sampai: $exp | Limit IP: $lim"
     echo "Domain: $DOMAIN | Port: 443 (TLS) | Network: ws"
+    [ -n "$alias" ] && echo "ID custom: $alias  ->  UUID: $id"
     echo
     make_link "$proto" "$name" "$id"
   else
@@ -271,184 +284,4 @@ extend_account() {
   today=$(date +%F)
   base=$old
   [[ "$old" < "$today" ]] && base=$today
-  new=$(date -d "$base +$days days" +%F)
-  sed -i "s/^\([^|]*|$name|[^|]*|\)[^|]*/\1$new/" "$DB"
-  echo "Expired baru untuk $name: $new"
-}
-
-clean_expired() {
-  local today
-  today=$(date +%F)
-  if awk -F'|' -v t="$today" '$4 < t {f=1} END {exit !f}' "$DB"; then
-    cp "$DB" "$DB.bak"
-    awk -F'|' -v t="$today" '$4 >= t' "$DB.bak" > "$DB"
-    rebuild || cp "$DB.bak" "$DB"
-    echo "Akun expired sudah dihapus."
-  else
-    echo "Tidak ada akun expired."
-  fi
-}
-
-set_limit() {
-  local name lim
-  list_accounts
-  read -rp "Nama akun: " name
-  grep -q "^[^|]*|$name|" "$DB" || { echo "Akun tidak ditemukan."; return; }
-  read -rp "Limit IP baru (0 = tanpa batas): " lim
-  [[ "$lim" =~ ^[0-9]{1,3}$ ]] || { echo "Angka tidak valid."; return; }
-  awk -F'|' -v OFS='|' -v n="$name" -v l="$lim" '$2 == n { $5 = l } { print }' "$DB" > "$DB.tmp" \
-    && mv "$DB.tmp" "$DB"
-  echo "Limit IP untuk $name sekarang: $lim"
-}
-
-unlock_account() {
-  local name
-  if [ ! -s "$LOCK" ]; then echo "Tidak ada akun yang terkunci."; return; fi
-  echo "Akun terkunci:"
-  cut -d'|' -f1 "$LOCK"
-  read -rp "Nama akun yang dibuka (atau 'all'): " name
-  cp "$LOCK" "$LOCK.bak"
-  if [ "$name" = "all" ]; then : > "$LOCK"; else awk -F'|' -v n="$name" '$1 != n' "$LOCK.bak" > "$LOCK"; fi
-  if rebuild; then echo "Kunci dibuka."; else cp "$LOCK.bak" "$LOCK"; fi
-}
-
-# Dipanggil cron tiap menit: hitung IP unik per akun, kunci sementara kalau melebihi limit
-check_limits() {
-  local now since changed=0 counts p name id exp lim cnt
-  [ -f "$ACCESS_LOG" ] || return 0
-  now=$(date +%s)
-
-  # buka kunci yang waktunya sudah lewat
-  if [ -s "$LOCK" ]; then
-    cp "$LOCK" "$LOCK.bak"
-    awk -F'|' -v n="$now" '$2 > n' "$LOCK.bak" > "$LOCK"
-    [ "$(wc -l < "$LOCK")" != "$(wc -l < "$LOCK.bak")" ] && changed=1
-  fi
-
-  since=$(date -d "-$WINDOW_MIN minutes" "+%Y/%m/%d %H:%M:%S")
-  counts=$(tail -n 30000 "$ACCESS_LOG" | awk -v s="$since" '
-    ($1 " " $2) >= s {
-      for (i = 3; i <= NF; i++) if ($i == "accepted") break
-      if (i > NF) next
-      ip = $(i - 1); sub(/^(tcp|udp):/, "", ip); sub(/:[0-9]+$/, "", ip)
-      if (!(($NF SUBSEP ip) in seen)) { seen[$NF, ip] = 1; c[$NF]++ }
-    }
-    END { for (n in c) print n, c[n] }')
-
-  while IFS='|' read -r p name id exp lim; do
-    [[ "$lim" =~ ^[0-9]+$ ]] && [ "$lim" -gt 0 ] || continue
-    grep -q "^$name|" "$LOCK" && continue
-    cnt=$(echo "$counts" | awk -v n="$name" '$1 == n { print $2 }')
-    if [ "${cnt:-0}" -gt "$lim" ]; then
-      echo "$name|$((now + LOCK_MIN * 60))" >> "$LOCK"
-      echo "$(date '+%F %T') $name dikunci $LOCK_MIN menit: $cnt IP (limit $lim)" >> /var/log/xray-manager.log
-      changed=1
-    fi
-  done < "$DB"
-
-  [ "$changed" = 1 ] && rebuild
-  return 0
-}
-
-status_all() {
-  echo "xray : $(systemctl is-active xray)"
-  echo "nginx: $(systemctl is-active nginx)"
-  echo -n "Sertifikat TLS: "
-  openssl x509 -in "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" -noout -enddate 2>/dev/null || echo "tidak terbaca"
-}
-
-test_path() {
-  local p
-  for p in vless vmess trojan-ws; do
-    echo -n "/$p -> "
-    curl -sk -i --http1.1 --max-time 4 \
-      -H "Connection: Upgrade" -H "Upgrade: websocket" \
-      -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" \
-      "https://$DOMAIN/$p" | head -n 1
-  done
-  echo "(HTTP/1.1 101 = jalur server beres)"
-}
-
-case "$1" in
-  --rebuild) rebuild; exit $? ;;
-  --clean) clean_expired >/dev/null 2>&1; exit 0 ;;
-  --check)
-    exec 9>/var/lock/xmenu.lock
-    flock -n 9 || exit 0
-    check_limits >/dev/null 2>&1
-    exit 0 ;;
-esac
-
-while true; do
-  clear
-  echo "=========== XRAY MANAGER ==========="
-  echo "Domain: $DOMAIN"
-  echo "1) Buat akun VLESS"
-  echo "2) Buat akun VMess"
-  echo "3) Buat akun Trojan"
-  echo "4) Daftar akun"
-  echo "5) Lihat link akun"
-  echo "6) Hapus akun"
-  echo "7) Perpanjang akun"
-  echo "8) Hapus akun expired sekarang"
-  echo "9) Status layanan dan sertifikat"
-  echo "10) Tes jalur server"
-  echo "11) Restart layanan"
-  echo "12) Ubah limit IP akun"
-  echo "13) Buka kunci akun (kena limit IP)"
-  echo "0) Keluar"
-  echo "===================================="
-  read -rp "Pilih: " c
-  echo
-  case "$c" in
-    1) add_account vless ;;
-    2) add_account vmess ;;
-    3) add_account trojan ;;
-    4) list_accounts ;;
-    5) show_link ;;
-    6) delete_account ;;
-    7) extend_account ;;
-    8) clean_expired ;;
-    9) status_all ;;
-    10) test_path ;;
-    11) systemctl restart xray nginx && echo "Layanan di-restart." ;;
-    12) set_limit ;;
-    13) unlock_account ;;
-    0) exit 0 ;;
-    *) echo "Pilihan tidak dikenal." ;;
-  esac
-  echo
-  read -rp "Tekan Enter untuk kembali ke menu..." _
-done
-XMENU
-chmod +x /usr/local/bin/xmenu
-
-echo "[6/6] Mengaktifkan BBR, cron hapus akun expired, dan Xray..."
-cat > /etc/sysctl.d/99-bbr.conf <<'SYSCTL'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-SYSCTL
-sysctl --system >/dev/null 2>&1 || true
-
-cat > /etc/cron.d/xray-manager <<'CRON'
-5 0 * * * root /usr/local/bin/xmenu --clean >/dev/null 2>&1
-* * * * * root /usr/local/bin/xmenu --check >/dev/null 2>&1
-CRON
-cat > /etc/logrotate.d/xray-manager <<'LOGROT'
-/var/log/xray/*.log {
-    daily
-    rotate 3
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
-LOGROT
-systemctl enable xray
-/usr/local/bin/xmenu --rebuild
-
-echo
-echo "==============================================="
-echo " Selesai. Ketik: xmenu"
-echo " Pastikan port 80 dan 443 (TCP) terbuka di firewall/security group VPS."
-echo "==============================================="
+  new=$(date -d "$base +$                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
